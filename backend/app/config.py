@@ -9,6 +9,8 @@ class Settings(BaseSettings):
     llm_model: str
     embedding_model: str = "all-MiniLM-L6-v2"
     session_ttl_minutes: int = 45
+    top_k: int = 5
+    similarity_threshold: float = 0.25
 
     model_config = SettingsConfigDict(
         env_file=Path(__file__).resolve().parents[1] / ".env",

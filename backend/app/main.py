@@ -1,20 +1,30 @@
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import asyncio
+import json
 from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
-from openai import AsyncOpenAI
+from fastapi.responses import JSONResponse, StreamingResponse
+from openai import AsyncOpenAI, RateLimitError
 from sentence_transformers import SentenceTransformer
 
 from .config import Settings
 from .dependencies import get_existing_session, get_session
 from .documents import SUPPORTED_EXTENSIONS, chunk_pages, extract_pages
-from .schemas import DocumentResponse, ErrorResponse, QueryRequest, QueryResponse, Source
+from .prompts import SYSTEM_PROMPT
+from .schemas import (
+    ChatRequest,
+    ChatSource,
+    DocumentResponse,
+    ErrorResponse,
+    QueryRequest,
+    QueryResponse,
+    Source,
+)
 from .store import SESSIONS, Session, StoredDocument, delete_idle_sessions
 
 
@@ -32,6 +42,8 @@ class Runtime:
     embedder: Embedder
     llm: ChatClient
     model: str
+    top_k: int
+    similarity_threshold: float
 
 
 MAX_DOCUMENT_BYTES = 10 * 1024 * 1024
@@ -51,7 +63,13 @@ def create_app(
             loaded_settings.embedding_model
         )
         loaded_llm = llm or _create_llm_client(loaded_settings)
-        app.state.runtime = Runtime(loaded_embedder, loaded_llm, loaded_settings.llm_model)
+        app.state.runtime = Runtime(
+            loaded_embedder,
+            loaded_llm,
+            loaded_settings.llm_model,
+            loaded_settings.top_k,
+            loaded_settings.similarity_threshold,
+        )
         cleanup_task = asyncio.create_task(_cleanup_loop(loaded_settings.session_ttl_minutes))
         try:
             yield
@@ -220,6 +238,45 @@ def create_app(
             ],
         )
 
+    @app.post("/chat")
+    async def chat(
+        request: ChatRequest,
+        session: Session = Depends(get_existing_session),
+    ) -> StreamingResponse:
+        runtime = _runtime(app)
+        matches = session.search(
+            list(runtime.embedder.encode(request.question, normalize_embeddings=True)),
+            runtime.top_k,
+            set(request.document_ids) if request.document_ids is not None else None,
+            runtime.similarity_threshold,
+        )
+        if not matches:
+            return StreamingResponse(
+                _not_found_events(),
+                media_type="text/event-stream",
+            )
+
+        context = "\n\n".join(
+            f"{number}. [{document.filename}, page {document.page}]\n{document.text}"
+            for number, (document, _) in enumerate(matches, start=1)
+        )
+        messages: list[dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages.extend(
+            {"role": turn.role, "content": turn.content}
+            for turn in (request.history or [])[-4:]
+        )
+        messages.append(
+            {
+                "role": "user",
+                "content": f"Context:\n{context}\n\nQuestion: {request.question}",
+            }
+        )
+        stream = await _start_chat_stream(runtime, messages)
+        return StreamingResponse(
+            _chat_events(stream, matches),
+            media_type="text/event-stream",
+        )
+
     return app
 
 
@@ -236,6 +293,64 @@ def _runtime(app: FastAPI) -> Runtime:
 
 def _vector(app: FastAPI) -> Embedder:
     return _runtime(app).embedder
+
+
+async def _start_chat_stream(runtime: Runtime, messages: list[dict[str, str]]) -> Any:
+    for attempt in range(3):
+        try:
+            return await runtime.llm.chat.completions.create(
+                model=runtime.model,
+                messages=messages,
+                stream=True,
+            )
+        except RateLimitError as exc:
+            if attempt == 2:
+                raise HTTPException(
+                    429,
+                    {"error": "rate_limited", "message": "The LLM provider rate limit was exceeded"},
+                ) from exc
+            await asyncio.sleep(0.25 * (2**attempt))
+        except Exception as exc:
+            raise HTTPException(
+                502,
+                {"error": "provider_error", "message": "The LLM provider request failed"},
+            ) from exc
+    raise RuntimeError("unreachable")
+
+
+async def _chat_events(stream: Any, matches: list[tuple[StoredDocument, float]]):
+    try:
+        async for chunk in stream:
+            text = chunk.choices[0].delta.content
+            if text:
+                yield _sse({"type": "token", "text": text})
+    except Exception:
+        return
+    yield _sse(
+        {
+            "type": "sources",
+            "sources": [
+                {
+                    "doc_id": document.document_id,
+                    "filename": document.filename,
+                    "page": document.page,
+                    "snippet": document.text[:240],
+                }
+                for document, _ in matches
+            ],
+        }
+    )
+    yield _sse({"type": "done"})
+
+
+async def _not_found_events():
+    yield _sse({"type": "token", "text": "not found in your documents"})
+    yield _sse({"type": "sources", "sources": []})
+    yield _sse({"type": "done"})
+
+
+def _sse(payload: dict[str, Any]) -> str:
+    return f"data: {json.dumps(payload)}\n\n"
 
 
 async def _cleanup_loop(ttl_minutes: int) -> None:

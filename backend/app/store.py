@@ -52,17 +52,28 @@ class Session:
             for document_id, (filename, pages, chunks) in summaries.items()
         ]
 
-    def search(self, query_embedding: list[float], limit: int) -> list[tuple[StoredDocument, float]]:
+    def search(
+        self,
+        query_embedding: list[float],
+        limit: int,
+        document_ids: set[str] | None = None,
+        threshold: float = float("-inf"),
+    ) -> list[tuple[StoredDocument, float]]:
         if self.index is None or not self.docs:
             return []
         distances, indices = self.index.search(
-            np.asarray([query_embedding], dtype="float32"), min(limit, len(self.docs))
+            np.asarray([query_embedding], dtype="float32"), len(self.docs)
         )
-        return [
-            (self.docs[int(index)], float(distance))
-            for distance, index in zip(distances[0], indices[0])
-            if index >= 0
-        ]
+        matches = []
+        for distance, index in zip(distances[0], indices[0]):
+            if index < 0 or distance < threshold:
+                continue
+            document = self.docs[int(index)]
+            if document_ids is None or document.document_id in document_ids:
+                matches.append((document, float(distance)))
+                if len(matches) == limit:
+                    break
+        return matches
 
 
 SESSIONS: dict[str, Session] = {}

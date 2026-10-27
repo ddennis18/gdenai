@@ -16,12 +16,29 @@ class FakeEmbedder:
 
 
 class FakeCompletions:
+    last_kwargs: dict = {}
+
     async def create(self, **kwargs):
+        self.last_kwargs = kwargs
+        if kwargs.get("stream"):
+            return FakeStream()
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="Study answer"))])
 
 
+class FakeStream:
+    def __aiter__(self):
+        return self._chunks()
+
+    async def _chunks(self):
+        for text in ("Study ", "answer"):
+            yield SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(content=text))]
+            )
+
+
 class FakeLlm:
-    chat = SimpleNamespace(completions=FakeCompletions())
+    completions = FakeCompletions()
+    chat = SimpleNamespace(completions=completions)
 
 
 @pytest.fixture
@@ -222,3 +239,69 @@ def test_session_document_limit_returns_413(client: TestClient) -> None:
         )
         assert response.status_code == 413
         assert response.json()["error"] == "document_limit_exceeded"
+
+
+def test_chat_streams_tokens_sources_and_done(client: TestClient) -> None:
+    with client as api:
+        upload = api.post(
+            "/documents",
+            headers={"X-Session-Id": "chat"},
+            files={"file": ("notes.txt", b"biology notes", "text/plain")},
+        )
+        response = api.post(
+            "/chat",
+            headers={"X-Session-Id": "chat"},
+            json={"question": "What is biology?"},
+        )
+        assert response.status_code == 200
+        events = [
+            __import__("json").loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        assert [event["type"] for event in events] == ["token", "token", "sources", "done"]
+        assert events[0]["text"] == "Study "
+        assert events[2]["sources"][0]["doc_id"] == upload.json()["id"]
+
+
+def test_chat_filters_documents_and_keeps_last_four_history(client: TestClient) -> None:
+    with client as api:
+        first = api.post(
+            "/documents",
+            headers={"X-Session-Id": "chat-filter"},
+            files={"file": ("first.txt", b"biology first", "text/plain")},
+        ).json()["id"]
+        api.post(
+            "/documents",
+            headers={"X-Session-Id": "chat-filter"},
+            files={"file": ("second.txt", b"biology second", "text/plain")},
+        )
+        history = [{"role": "user", "content": str(number)} for number in range(6)]
+        response = api.post(
+            "/chat",
+            headers={"X-Session-Id": "chat-filter"},
+            json={"question": "biology", "document_ids": [first], "history": history},
+        )
+        assert response.status_code == 200
+        messages = FakeLlm.completions.last_kwargs["messages"]
+        assert [message["content"] for message in messages[1:5]] == ["2", "3", "4", "5"]
+        assert f"[first.txt, page 1]" in messages[-1]["content"]
+        assert "second.txt" not in messages[-1]["content"]
+
+
+def test_chat_not_found_skips_provider(client: TestClient) -> None:
+    with client as api:
+        api.post(
+            "/documents",
+            headers={"X-Session-Id": "chat-not-found"},
+            files={"file": ("notes.txt", b"biology notes", "text/plain")},
+        )
+        FakeLlm.completions.last_kwargs = {}
+        response = api.post(
+            "/chat",
+            headers={"X-Session-Id": "chat-not-found"},
+            json={"question": "biology", "document_ids": ["missing"]},
+        )
+        assert response.status_code == 200
+        assert "not found in your documents" in response.text
+        assert FakeLlm.completions.last_kwargs == {}
