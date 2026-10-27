@@ -10,12 +10,13 @@ from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from openai import AsyncOpenAI, RateLimitError
+from pydantic import TypeAdapter, ValidationError
 from sentence_transformers import SentenceTransformer
 
 from .config import Settings
 from .dependencies import get_existing_session, get_session
 from .documents import SUPPORTED_EXTENSIONS, chunk_pages, extract_pages
-from .prompts import SYSTEM_PROMPT
+from .prompts import QUIZ_SYSTEM_PROMPT, SYSTEM_PROMPT
 from .schemas import (
     ChatRequest,
     ChatSource,
@@ -23,6 +24,8 @@ from .schemas import (
     ErrorResponse,
     QueryRequest,
     QueryResponse,
+    QuizQuestion,
+    QuizRequest,
     Source,
 )
 from .store import SESSIONS, Session, StoredDocument, delete_idle_sessions
@@ -277,6 +280,63 @@ def create_app(
             media_type="text/event-stream",
         )
 
+    @app.post("/quiz", response_model=list[QuizQuestion])
+    async def quiz(
+        request: QuizRequest,
+        session: Session = Depends(get_existing_session),
+    ) -> list[QuizQuestion]:
+        chunks = session.sample_document_chunks(request.document_id, request.num_questions)
+        if not chunks:
+            raise HTTPException(
+                404,
+                {"error": "document_not_found", "message": "Document not found"},
+            )
+
+        context = "\n\n".join(
+            f"[{document.filename}, page {document.page}]\n{document.text}"
+            for document in chunks
+        )
+        messages = [
+            {"role": "system", "content": QUIZ_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Create {request.num_questions} multiple-choice questions from these excerpts. "
+                    f"Return a JSON array only.\n\n{context}"
+                ),
+            },
+        ]
+        for attempt in range(2):
+            try:
+                completion = await _start_quiz_completion(app, messages)
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise HTTPException(
+                    502,
+                    {"error": "provider_error", "message": "The LLM provider request failed"},
+                ) from exc
+            try:
+                payload = json.loads(completion.choices[0].message.content or "")
+                questions = TypeAdapter(list[QuizQuestion]).validate_python(payload)
+                if len(questions) != request.num_questions:
+                    raise ValueError("The LLM returned the wrong number of questions")
+                return questions
+            except (
+                json.JSONDecodeError,
+                ValidationError,
+                TypeError,
+                ValueError,
+                IndexError,
+                AttributeError,
+            ) as exc:
+                if attempt == 1:
+                    raise HTTPException(
+                        502,
+                        {"error": "invalid_quiz_response", "message": "The LLM returned invalid quiz JSON"},
+                    ) from exc
+        raise RuntimeError("unreachable")
+
     return app
 
 
@@ -316,6 +376,15 @@ async def _start_chat_stream(runtime: Runtime, messages: list[dict[str, str]]) -
                 {"error": "provider_error", "message": "The LLM provider request failed"},
             ) from exc
     raise RuntimeError("unreachable")
+
+
+async def _start_quiz_completion(app: FastAPI, messages: list[dict[str, str]]) -> Any:
+    runtime = _runtime(app)
+    return await runtime.llm.chat.completions.create(
+        model=runtime.model,
+        messages=messages,
+        temperature=0.3,
+    )
 
 
 async def _chat_events(stream: Any, matches: list[tuple[StoredDocument, float]]):

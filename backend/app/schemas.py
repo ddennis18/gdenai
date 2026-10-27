@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class DocumentResponse(BaseModel):
@@ -43,6 +43,25 @@ class ChatSource(BaseModel):
     filename: str
     page: int
     snippet: str
+
+
+class QuizRequest(BaseModel):
+    document_id: str = Field(min_length=1)
+    num_questions: int = Field(ge=1, le=20)
+
+
+class QuizQuestion(BaseModel):
+    question: str = Field(min_length=1)
+    options: list[str] = Field(min_length=4, max_length=4)
+    answer: str = Field(min_length=1)
+    explanation: str = Field(min_length=1)
+    source_page: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def validate_answer(self) -> "QuizQuestion":
+        if self.answer not in self.options:
+            raise ValueError("answer must match one of the options")
+        return self
 
 
 class ErrorResponse(BaseModel):

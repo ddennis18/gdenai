@@ -52,6 +52,13 @@ class Session:
             for document_id, (filename, pages, chunks) in summaries.items()
         ]
 
+    def sample_document_chunks(self, document_id: str, limit: int) -> list[StoredDocument]:
+        chunks = [document for document in self.docs if document.document_id == document_id]
+        if len(chunks) <= limit:
+            return chunks
+        positions = np.linspace(0, len(chunks) - 1, num=limit, dtype=int)
+        return [chunks[int(position)] for position in positions]
+
     def search(
         self,
         query_embedding: list[float],

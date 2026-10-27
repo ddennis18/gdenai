@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import json
 from types import SimpleNamespace
 
 import pymupdf
@@ -39,6 +40,44 @@ class FakeStream:
 class FakeLlm:
     completions = FakeCompletions()
     chat = SimpleNamespace(completions=completions)
+
+
+class QuizCompletions:
+    def __init__(self, responses: list[str]):
+        self.responses = responses
+        self.calls: list[dict] = []
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=self.responses.pop(0))
+                )
+            ]
+        )
+
+
+class QuizLlm:
+    def __init__(self, responses: list[str]):
+        self.completions = QuizCompletions(responses)
+        self.chat = SimpleNamespace(completions=self.completions)
+
+
+def quiz_client(responses: list[str]) -> tuple[TestClient, QuizCompletions]:
+    llm = QuizLlm(responses)
+    client = TestClient(
+        create_app(
+            FakeEmbedder(),
+            llm,
+            Settings(
+                llm_base_url="https://test.invalid/v1",
+                llm_api_key="test-key",
+                llm_model="test-model",
+            ),
+        )
+    )
+    return client, llm.completions
 
 
 @pytest.fixture
@@ -305,3 +344,93 @@ def test_chat_not_found_skips_provider(client: TestClient) -> None:
         assert response.status_code == 200
         assert "not found in your documents" in response.text
         assert FakeLlm.completions.last_kwargs == {}
+
+
+def test_quiz_returns_validated_questions() -> None:
+    quiz_json = json.dumps(
+        [
+            {
+                "question": "What is biology?",
+                "options": ["A", "B", "C", "D"],
+                "answer": "A",
+                "explanation": "It studies living systems.",
+                "source_page": 1,
+            }
+        ]
+    )
+    client, completions = quiz_client([quiz_json])
+    with client as api:
+        document_id = api.post(
+            "/documents",
+            headers={"X-Session-Id": "quiz"},
+            files={"file": ("notes.txt", b"biology notes", "text/plain")},
+        ).json()["id"]
+        response = api.post(
+            "/quiz",
+            headers={"X-Session-Id": "quiz"},
+            json={"document_id": document_id, "num_questions": 1},
+        )
+        assert response.status_code == 200
+        assert response.json()[0]["options"] == ["A", "B", "C", "D"]
+        assert len(completions.calls) == 1
+        assert completions.calls[0]["messages"][0]["role"] == "system"
+
+
+def test_quiz_retries_once_on_invalid_json() -> None:
+    quiz_json = json.dumps(
+        [{
+            "question": "Q",
+            "options": ["A", "B", "C", "D"],
+            "answer": "A",
+            "explanation": "Because.",
+            "source_page": 1,
+        }]
+    )
+    client, completions = quiz_client(["not json", quiz_json])
+    with client as api:
+        document_id = api.post(
+            "/documents",
+            headers={"X-Session-Id": "quiz-retry"},
+            files={"file": ("notes.txt", b"notes", "text/plain")},
+        ).json()["id"]
+        response = api.post(
+            "/quiz",
+            headers={"X-Session-Id": "quiz-retry"},
+            json={"document_id": document_id, "num_questions": 1},
+        )
+        assert response.status_code == 200
+        assert len(completions.calls) == 2
+
+
+def test_quiz_returns_502_after_two_invalid_responses() -> None:
+    client, completions = quiz_client(["bad", "still bad"])
+    with client as api:
+        document_id = api.post(
+            "/documents",
+            headers={"X-Session-Id": "quiz-failure"},
+            files={"file": ("notes.txt", b"notes", "text/plain")},
+        ).json()["id"]
+        response = api.post(
+            "/quiz",
+            headers={"X-Session-Id": "quiz-failure"},
+            json={"document_id": document_id, "num_questions": 1},
+        )
+        assert response.status_code == 502
+        assert response.json()["error"] == "invalid_quiz_response"
+        assert len(completions.calls) == 2
+
+
+def test_quiz_missing_document_returns_404(client: TestClient) -> None:
+    with client as api:
+        api.post(
+            "/documents",
+            headers={"X-Session-Id": "quiz-missing"},
+            files={"file": ("notes.txt", b"notes", "text/plain")},
+        )
+        response = api.post(
+            "/quiz",
+            headers={"X-Session-Id": "quiz-missing"},
+            json={"document_id": "missing", "num_questions": 1},
+        )
+        assert response.status_code == 404
+        assert response.json()["error"] == "document_not_found"
