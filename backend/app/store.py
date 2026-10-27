@@ -11,6 +11,7 @@ class StoredDocument:
     filename: str
     text: str
     page: int
+    embedding: list[float]
 
 
 @dataclass
@@ -26,6 +27,31 @@ class Session:
         self.index.add(vectors)
         self.docs.extend(documents)
 
+    def delete_document(self, document_id: str) -> bool:
+        if not any(document.document_id == document_id for document in self.docs):
+            return False
+        self.docs = [document for document in self.docs if document.document_id != document_id]
+        if self.docs:
+            vectors = np.asarray([document.embedding for document in self.docs], dtype="float32")
+            self.index = faiss.IndexFlatIP(vectors.shape[1])
+            self.index.add(vectors)
+        else:
+            self.index = None
+        return True
+
+    def documents(self) -> list[tuple[str, str, int, int]]:
+        summaries: dict[str, tuple[str, set[int], int]] = {}
+        for document in self.docs:
+            if document.document_id not in summaries:
+                summaries[document.document_id] = (document.filename, set(), 0)
+            filename, pages, chunks = summaries[document.document_id]
+            pages.add(document.page)
+            summaries[document.document_id] = (filename, pages, chunks + 1)
+        return [
+            (document_id, filename, len(pages), chunks)
+            for document_id, (filename, pages, chunks) in summaries.items()
+        ]
+
     def search(self, query_embedding: list[float], limit: int) -> list[tuple[StoredDocument, float]]:
         if self.index is None or not self.docs:
             return []
@@ -40,3 +66,14 @@ class Session:
 
 
 SESSIONS: dict[str, Session] = {}
+
+
+def delete_idle_sessions(ttl_minutes: int) -> None:
+    cutoff = datetime.now(timezone.utc).timestamp() - ttl_minutes * 60
+    expired = [
+        session_id
+        for session_id, session in SESSIONS.items()
+        if session.last_active.timestamp() < cutoff
+    ]
+    for session_id in expired:
+        del SESSIONS[session_id]

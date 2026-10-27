@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+import asyncio
 from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
@@ -11,10 +12,10 @@ from openai import AsyncOpenAI
 from sentence_transformers import SentenceTransformer
 
 from .config import Settings
-from .dependencies import get_session
+from .dependencies import get_existing_session, get_session
 from .documents import SUPPORTED_EXTENSIONS, chunk_pages, extract_pages
 from .schemas import DocumentResponse, ErrorResponse, QueryRequest, QueryResponse, Source
-from .store import Session, StoredDocument
+from .store import SESSIONS, Session, StoredDocument, delete_idle_sessions
 
 
 class Embedder(Protocol):
@@ -51,7 +52,12 @@ def create_app(
         )
         loaded_llm = llm or _create_llm_client(loaded_settings)
         app.state.runtime = Runtime(loaded_embedder, loaded_llm, loaded_settings.llm_model)
-        yield
+        cleanup_task = asyncio.create_task(_cleanup_loop(loaded_settings.session_ttl_minutes))
+        try:
+            yield
+        finally:
+            cleanup_task.cancel()
+            await asyncio.gather(cleanup_task, return_exceptions=True)
 
     app = FastAPI(title="AI Study Assistant", lifespan=lifespan)
 
@@ -128,13 +134,13 @@ def create_app(
             )
 
         document_id = str(uuid4())
-        documents = [
-            StoredDocument(document_id, filename, chunk.text, chunk.page)
-            for chunk in chunks
-        ]
         embeddings = [
             list(_vector(app).encode(chunk.text, normalize_embeddings=True))
             for chunk in chunks
+        ]
+        documents = [
+            StoredDocument(document_id, filename, chunk.text, chunk.page, embedding)
+            for chunk, embedding in zip(chunks, embeddings)
         ]
         session.add(documents, embeddings)
         return DocumentResponse(
@@ -144,10 +150,41 @@ def create_app(
             chunks=len(chunks),
         )
 
+    @app.get("/documents", response_model=list[DocumentResponse])
+    async def list_documents(
+        session: Session = Depends(get_existing_session),
+    ) -> list[DocumentResponse]:
+        return [
+            DocumentResponse(id=document_id, filename=filename, pages=pages, chunks=chunks)
+            for document_id, filename, pages, chunks in session.documents()
+        ]
+
+    @app.delete("/documents/{document_id}")
+    async def delete_document(
+        document_id: str,
+        session: Session = Depends(get_existing_session),
+    ) -> dict[str, str]:
+        if not session.delete_document(document_id):
+            raise HTTPException(
+                404,
+                {"error": "document_not_found", "message": "Document not found"},
+            )
+        return {"id": document_id, "status": "deleted"}
+
+    @app.delete("/session")
+    async def delete_session(
+        session: Session = Depends(get_existing_session),
+    ) -> dict[str, str]:
+        for session_id, stored_session in list(SESSIONS.items()):
+            if stored_session is session:
+                del SESSIONS[session_id]
+                break
+        return {"status": "deleted"}
+
     @app.post("/query", response_model=QueryResponse)
     async def query(
         request: QueryRequest,
-        session: Session = Depends(get_session),
+        session: Session = Depends(get_existing_session),
     ) -> QueryResponse:
         runtime = _runtime(app)
         matches = session.search(
@@ -199,6 +236,12 @@ def _runtime(app: FastAPI) -> Runtime:
 
 def _vector(app: FastAPI) -> Embedder:
     return _runtime(app).embedder
+
+
+async def _cleanup_loop(ttl_minutes: int) -> None:
+    while True:
+        await asyncio.sleep(60)
+        delete_idle_sessions(ttl_minutes)
 
 
 app = create_app()

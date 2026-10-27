@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pymupdf
@@ -6,7 +7,7 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import create_app
-from app.store import SESSIONS
+from app.store import SESSIONS, Session, delete_idle_sessions
 
 
 class FakeEmbedder:
@@ -49,7 +50,7 @@ def test_documents_are_isolated_by_session(client: TestClient) -> None:
         assert response.status_code == 201
         missing = api.post("/query", headers={"X-Session-Id": "two"}, json={"question": "biology"})
         assert missing.status_code == 404
-        assert missing.json()["error"] == "no_documents"
+        assert missing.json()["error"] == "session_expired"
 
 
 def test_query_returns_answer_and_sources(client: TestClient) -> None:
@@ -83,14 +84,73 @@ def test_session_is_created_and_activity_is_updated(client: TestClient) -> None:
     session_id = "activity-check"
     SESSIONS.pop(session_id, None)
     with client as api:
-        response = api.post("/query", headers={"X-Session-Id": session_id}, json={"question": "biology"})
-        assert response.status_code == 404
+        response = api.post(
+            "/documents",
+            headers={"X-Session-Id": session_id},
+            files={"file": ("notes.txt", b"notes", "text/plain")},
+        )
+        assert response.status_code == 201
         session = SESSIONS[session_id]
         first_active = session.last_active
 
         response = api.post("/query", headers={"X-Session-Id": session_id}, json={"question": "biology"})
-        assert response.status_code == 404
+        assert response.status_code == 200
         assert SESSIONS[session_id].last_active >= first_active
+
+
+def test_documents_can_be_listed_and_deleted(client: TestClient) -> None:
+    with client as api:
+        upload = api.post(
+            "/documents",
+            headers={"X-Session-Id": "document-actions"},
+            files={"file": ("notes.txt", b"notes", "text/plain")},
+        )
+        document_id = upload.json()["id"]
+        listed = api.get("/documents", headers={"X-Session-Id": "document-actions"})
+        assert listed.status_code == 200
+        assert listed.json()[0]["id"] == document_id
+
+        deleted = api.delete(
+            f"/documents/{document_id}",
+            headers={"X-Session-Id": "document-actions"},
+        )
+        assert deleted.status_code == 200
+        assert api.get("/documents", headers={"X-Session-Id": "document-actions"}).json() == []
+
+
+def test_session_can_be_deleted_and_then_expires(client: TestClient) -> None:
+    with client as api:
+        api.post(
+            "/documents",
+            headers={"X-Session-Id": "delete-session"},
+            files={"file": ("notes.txt", b"notes", "text/plain")},
+        )
+        response = api.delete("/session", headers={"X-Session-Id": "delete-session"})
+        assert response.status_code == 200
+        expired = api.get("/documents", headers={"X-Session-Id": "delete-session"})
+        assert expired.status_code == 404
+        assert expired.json()["error"] == "session_expired"
+
+
+def test_unknown_session_returns_session_expired(client: TestClient) -> None:
+    with client as api:
+        for method, path in [
+            (api.get, "/documents"),
+            (api.delete, "/session"),
+            (api.delete, "/documents/unknown"),
+        ]:
+            response = method(path, headers={"X-Session-Id": "unknown"})
+            assert response.status_code == 404
+            assert response.json()["error"] == "session_expired"
+
+
+def test_idle_sessions_are_removed_by_ttl_cleanup() -> None:
+    session_id = "stale-session"
+    SESSIONS[session_id] = Session(
+        last_active=datetime.now(timezone.utc) - timedelta(minutes=46)
+    )
+    delete_idle_sessions(45)
+    assert session_id not in SESSIONS
 
 
 def test_document_upload_returns_page_and_chunk_metadata(client: TestClient) -> None:
