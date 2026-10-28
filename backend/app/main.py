@@ -2,17 +2,19 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import asyncio
 import json
+import math
+import time
 from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
 
+import httpx
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from openai import AsyncOpenAI, RateLimitError
 from pydantic import TypeAdapter, ValidationError
-from sentence_transformers import SentenceTransformer
 
 from .config import Settings
 from .dependencies import get_existing_session, get_session
@@ -41,6 +43,48 @@ class ChatClient(Protocol):
     def chat(self) -> Any: ...
 
 
+# --- REPLACED: Lightweight Hugging Face Inference API Embedder ---
+class HFInferenceEmbedder:
+    def __init__(self, api_token: str, model_name: str):
+        self.api_url = f"https://api-inference.huggingface.co/models/{model_name}"
+        self.headers = {"Authorization": f"Bearer {api_token}"}
+
+    def encode(self, text: str, normalize_embeddings: bool = True) -> list[float]:
+        # We use a retry loop to handle HF free-tier rate limits (429) and model loading (503)
+        with httpx.Client(timeout=30.0) as client:
+            for attempt in range(5):
+                try:
+                    response = client.post(
+                        self.api_url,
+                        headers=self.headers,
+                        json={"inputs": text, "options": {"wait_for_model": True}}
+                    )
+                    if response.status_code == 503:
+                        time.sleep(2)
+                        continue
+                    if response.status_code == 429:
+                        time.sleep(2)
+                        continue
+                    
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    # Handle HF API returning nested lists vs flat lists
+                    embedding = data[0] if isinstance(data[0], list) else data
+                    
+                    if normalize_embeddings:
+                        norm = math.sqrt(sum(x*x for x in embedding))
+                        if norm > 0:
+                            embedding = [x / norm for x in embedding]
+                    return embedding
+                    
+                except httpx.HTTPError as exc:
+                    if attempt == 4:
+                        raise RuntimeError(f"Failed to get embeddings from HF: {exc}")
+                    time.sleep(2)
+        return []
+
+
 @dataclass
 class Runtime:
     embedder: Embedder
@@ -60,13 +104,14 @@ def create_app(
     settings: Settings | None = None,
 ) -> FastAPI:
 
-    # Load settings immediately so we can configure CORS
     loaded_settings = settings or Settings()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        loaded_embedder = embedder or SentenceTransformer(
-            loaded_settings.embedding_model
+        # Use the new lightweight embedder
+        loaded_embedder = embedder or HFInferenceEmbedder(
+            api_token=loaded_settings.hf_token,
+            model_name=loaded_settings.embedding_model
         )
         loaded_llm = llm or _create_llm_client(loaded_settings)
         app.state.runtime = Runtime(
@@ -85,12 +130,9 @@ def create_app(
 
     app = FastAPI(title="AI Study Assistant", lifespan=lifespan)
 
-    # --- SECURE CORS CONFIGURATION ---
-    # We split the string by comma to allow multiple URLs (e.g. local + live)
     allowed_origins = [
         url.strip() for url in loaded_settings.frontend_url.split(",") if url.strip()
     ]
-    
     app.add_middleware(
         CORSMiddleware,
         allow_origins=allowed_origins,
@@ -98,7 +140,6 @@ def create_app(
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    # ---------------------------------
 
     @app.exception_handler(HTTPException)
     async def http_error_handler(_, exc: HTTPException) -> JSONResponse:
@@ -173,10 +214,14 @@ def create_app(
             )
 
         document_id = str(uuid4())
-        embeddings = [
-            list(_vector(app).encode(chunk.text, normalize_embeddings=True))
-            for chunk in chunks
-        ]
+        
+        # --- NOTE: We are calling the HF API sequentially here. 
+        # For a demo, this takes ~1-2 seconds per chunk. 
+        embeddings = []
+        for chunk in chunks:
+            emb = await asyncio.to_thread(_vector(app).encode, chunk.text, normalize_embeddings=True)
+            embeddings.append(emb)
+
         documents = [
             StoredDocument(document_id, filename, chunk.text, chunk.page, embedding)
             for chunk, embedding in zip(chunks, embeddings)
@@ -226,8 +271,9 @@ def create_app(
         session: Session = Depends(get_existing_session),
     ) -> QueryResponse:
         runtime = _runtime(app)
+        query_emb = await asyncio.to_thread(runtime.embedder.encode, request.question, normalize_embeddings=True)
         matches = session.search(
-            list(runtime.embedder.encode(request.question, normalize_embeddings=True)),
+            list(query_emb),
             request.top_k,
         )
         if not matches:
@@ -265,8 +311,9 @@ def create_app(
         session: Session = Depends(get_existing_session),
     ) -> StreamingResponse:
         runtime = _runtime(app)
+        query_emb = await asyncio.to_thread(runtime.embedder.encode, request.question, normalize_embeddings=True)
         matches = session.search(
-            list(runtime.embedder.encode(request.question, normalize_embeddings=True)),
+            list(query_emb),
             runtime.top_k,
             set(request.document_ids) if request.document_ids is not None else None,
             runtime.similarity_threshold,
