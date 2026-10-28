@@ -15,7 +15,7 @@ const CONFIG = {
     ENVIRONMENT: 'live', 
     API_URLS: {
         LOCAL: 'http://localhost:8000',
-        LIVE: 'https://your-live-backend-link.onrender.com' 
+        LIVE: 'https://gdenai.onrender.com' 
     },
     get API_BASE_URL() {
         return this.API_URLS[this.ENVIRONMENT.toUpperCase()];
