@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from openai import AsyncOpenAI, RateLimitError
 from pydantic import TypeAdapter, ValidationError
@@ -59,9 +60,11 @@ def create_app(
     settings: Settings | None = None,
 ) -> FastAPI:
 
+    # Load settings immediately so we can configure CORS
+    loaded_settings = settings or Settings()
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        loaded_settings = settings or Settings()
         loaded_embedder = embedder or SentenceTransformer(
             loaded_settings.embedding_model
         )
@@ -81,6 +84,21 @@ def create_app(
             await asyncio.gather(cleanup_task, return_exceptions=True)
 
     app = FastAPI(title="AI Study Assistant", lifespan=lifespan)
+
+    # --- SECURE CORS CONFIGURATION ---
+    # We split the string by comma to allow multiple URLs (e.g. local + live)
+    allowed_origins = [
+        url.strip() for url in loaded_settings.frontend_url.split(",") if url.strip()
+    ]
+    
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    # ---------------------------------
 
     @app.exception_handler(HTTPException)
     async def http_error_handler(_, exc: HTTPException) -> JSONResponse:
@@ -275,9 +293,11 @@ def create_app(
             }
         )
         stream = await _start_chat_stream(runtime, messages)
+        
         return StreamingResponse(
             _chat_events(stream, matches),
             media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no"},
         )
 
     @app.post("/quiz", response_model=list[QuizQuestion])

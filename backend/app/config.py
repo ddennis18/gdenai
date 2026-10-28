@@ -11,6 +11,9 @@ class Settings(BaseSettings):
     session_ttl_minutes: int = 45
     top_k: int = 5
     similarity_threshold: float = 0.25
+    
+    # REMOVED default value. This is now required in the .env file.
+    frontend_url: str
 
     model_config = SettingsConfigDict(
         env_file=Path(__file__).resolve().parents[1] / ".env",
