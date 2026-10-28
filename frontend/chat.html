@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Query AI | GDenAI</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Lora:wght@500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <nav class="navbar">
+        <a href="index.html" class="nav-brand">GDenAI</a>
+        <div class="nav-links">
+            <a href="index.html">Overview</a>
+            <a href="documents.html">My Materials</a>
+            <a href="chat.html" class="active">Query AI</a>
+        </div>
+    </nav>
+
+    <div class="app-container">
+        <!-- Sidebar (Quick view of documents) -->
+        <aside class="sidebar">
+            <h2 class="sidebar-header">Active Context</h2>
+            <div class="quick-upload" id="quick-upload-btn">
+                <span style="font-size: var(--text-small); color: var(--text-muted);">+ Add Document</span>
+                <input type="file" id="quick-file-input" accept=".pdf,.docx,.txt" hidden>
+            </div>
+            
+            <div class="doc-list" id="sidebar-doc-list">
+                <!-- Rendered by JS -->
+            </div>
+            
+                
+    
+    <div style="margin-top: var(--space-4); border-top: 1px solid rgba(96,17,120,0.1); padding-top: var(--space-3); font-size: var(--text-micro); color: var(--text-muted); display: flex; justify-content: space-between; align-items: center;">
+        <a href="documents.html" style="color: var(--color-brand); text-decoration: none;">Manage Materials &rarr;</a>
+        <button class="btn-text" id="export-chat-btn" style="font-size: var(--text-micro);">Export Chat</button>
+    </div>
+</aside>
+      
+
+        <!-- Main Chat -->
+        <main class="chat-main">
+            <div class="chat-history" id="chat-history">
+                <div class="message-group ai-group">
+                    <div class="message-bubble ai-bubble">
+                        Context loaded. Ask me anything based on your uploaded materials.
+                    </div>
+                </div>
+            </div>
+
+            <!-- Suggested Prompts -->
+            <div class="suggested-prompts">
+                <button class="prompt-chip">Summarize these documents</button>
+                <button class="prompt-chip">What are the key definitions?</button>
+                <button class="prompt-chip">Explain the main concept simply</button>
+            </div>
+
+            <div class="chat-input-wrapper">
+                <input type="text" id="chat-input" placeholder="Ask a specific question..." autocomplete="off">
+                <button class="btn btn-primary" id="send-btn">Send</button>
+            </div>
+        </main>
+    </div>
+
+    <script src="js/config.js"></script>
+    <script src="js/state.js"></script>
+    <script src="js/validator.js"></script>
+    <script src="js/api.js"></script>
+    <script src="js/ui.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>
