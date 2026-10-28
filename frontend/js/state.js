@@ -2,12 +2,11 @@
 // STATE MANAGEMENT
 // =========================================
 const State = {
-    // Cryptographically secure session ID
     sessionId: null,
     documents: [],
+    history: [], // Stores conversation for context
 
     init() {
-        // Get or generate Session ID (Updated to GDenAI)
         let sid = localStorage.getItem('gdenai_session_id');
         if (!sid) {
             sid = crypto.randomUUID();
@@ -15,10 +14,22 @@ const State = {
         }
         this.sessionId = sid;
 
-        // Load documents from local storage (Updated to GDenAI)
         const savedDocs = localStorage.getItem('gdenai_docs');
         if (savedDocs) {
             this.documents = JSON.parse(savedDocs);
+        }
+    },
+
+    // Sync local state with the actual backend server
+    async syncWithBackend() {
+        if (CONFIG.USE_MOCK_DATA) return;
+        try {
+            const serverDocs = await API.getDocuments();
+            // If backend session expired, it returns [] and we clear local
+            this.documents = serverDocs || [];
+            this._save();
+        } catch (e) {
+            console.warn("Could not sync with backend", e);
         }
     },
 
@@ -34,7 +45,14 @@ const State = {
 
     clearAll() {
         this.documents = [];
+        this.history = []; // Clear chat history too
         this._save();
+    },
+
+    addToHistory(role, content) {
+        this.history.push({ role, content });
+        // Keep only last 4 messages for backend context limit
+        if (this.history.length > 4) this.history.shift();
     },
 
     _save() {
@@ -42,5 +60,4 @@ const State = {
     }
 };
 
-// Initialize state immediately
 State.init();

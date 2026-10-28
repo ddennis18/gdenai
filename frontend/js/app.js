@@ -2,10 +2,12 @@
 // MAIN APPLICATION LOGIC
 // =========================================
 const App = {
-    init() {
+    async init() {
         const path = window.location.pathname;
         
-        // Page Router
+        // Fetch real documents from backend on page load
+        await State.syncWithBackend();
+
         if (path.includes('documents.html')) {
             this.initDocumentsPage();
         } else if (path.includes('chat.html')) {
@@ -15,7 +17,6 @@ const App = {
         UI.renderDocuments();
     },
 
-    // --- DOCUMENTS PAGE LOGIC ---
     initDocumentsPage() {
         const dropZone = document.getElementById('drop-zone');
         const fileInput = document.getElementById('file-input');
@@ -31,11 +32,9 @@ const App = {
             e.preventDefault(); 
             dropZone.style.borderColor = 'var(--color-brand)'; 
         });
-        
         dropZone.addEventListener('dragleave', () => {
             dropZone.style.borderColor = 'var(--color-accent-soft)';
         });
-        
         dropZone.addEventListener('drop', (e) => {
             e.preventDefault();
             dropZone.style.borderColor = 'var(--color-accent-soft)';
@@ -43,8 +42,9 @@ const App = {
         });
 
         if (clearBtn) {
-            clearBtn.addEventListener('click', () => {
+            clearBtn.addEventListener('click', async () => {
                 if(confirm("Are you sure you want to delete all materials and start over?")) {
+                    await API.clearSession();
                     State.clearAll();
                     UI.renderDocuments();
                 }
@@ -52,7 +52,6 @@ const App = {
         }
     },
 
-    // --- CHAT PAGE LOGIC ---
     initChatPage() {
         const quickUploadBtn = document.getElementById('quick-upload-btn');
         const quickFileInput = document.getElementById('quick-file-input');
@@ -71,12 +70,8 @@ const App = {
             if (e.key === 'Enter') this.handleQuery(); 
         });
 
-        // Export Chat Event Listener
-        if (exportBtn) {
-            exportBtn.addEventListener('click', () => this.exportChat());
-        }
+        if (exportBtn) exportBtn.addEventListener('click', () => this.exportChat());
 
-        // Suggested Prompts Logic
         prompts.forEach(btn => {
             btn.addEventListener('click', () => {
                 chatInput.value = btn.textContent;
@@ -85,23 +80,16 @@ const App = {
         });
     },
 
-    // --- SHARED ACTIONS ---
     async handleUpload(file) {
-        // 1. Validate
         const validation = Validator.validateFile(file, State.documents.length);
-        if (!validation.valid) {
-            UI.showError(validation.message);
-            return;
-        }
+        if (!validation.valid) return UI.showError(validation.message);
 
-        // 2. Upload
         try {
             UI.showError("Processing document..."); 
             const newDoc = await API.uploadDocument(file);
             State.addDocument(newDoc);
             UI.renderDocuments();
             
-            // Reset file inputs so the same file can be uploaded again if deleted
             const fileInputs = document.querySelectorAll('input[type="file"]');
             fileInputs.forEach(input => input.value = '');
         } catch (error) {
@@ -126,39 +114,62 @@ const App = {
         if (!question) return;
 
         if (State.documents.length === 0) {
-            UI.showError("Please upload at least one document before querying.");
-            return;
+            return UI.showError("Please upload at least one document before querying.");
         }
 
         // 1. Add User Message
         UI.addMessage('user', question);
+        State.addToHistory('user', question); // Save to context
         input.value = '';
 
-        // 2. Add Typing Indicator
-        const thinkingId = 'thinking-' + Date.now();
-        UI.addMessage('ai', '<div class="typing-indicator"><div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div></div>', thinkingId);
+        // 2. Create empty AI Bubble for streaming
+        const aiMsgId = 'ai-msg-' + Date.now();
+        UI.addMessage('ai', '', aiMsgId); // Start empty
 
-        // 3. Fetch AI Response
+        // 3. Start Streaming
+        let fullAnswer = '';
+        await API.chatStream(
+            question,
+            (token) => {
+                // On Token (Typewriter effect)
+                fullAnswer += token;
+                UI.appendToStream(aiMsgId, token);
+            },
+            (sources) => {
+                // On Sources received
+                UI.addSourcesToStream(aiMsgId, sources);
+            },
+            () => {
+                // On Done
+                State.addToHistory('assistant', fullAnswer);
+            },
+            (error) => {
+                // On Error
+                document.getElementById(aiMsgId)?.remove();
+                UI.addMessage('ai', `Error: ${error}`);
+            }
+        );
+    },
+
+    async handleQuiz(docId, filename) {
         try {
-            const data = await API.query(question);
-            document.getElementById(thinkingId)?.remove();
-            UI.addAIMessage(data.answer, data.sources);
+            UI.showError("Generating quiz from document...");
+            const questions = await API.generateQuiz(docId, 3); // Generate 3 questions
+            UI.renderQuizModal(questions, filename);
         } catch (error) {
-            document.getElementById(thinkingId)?.remove();
-            UI.addMessage('ai', `Error: ${error.message}`);
+            UI.showError(error.message);
         }
     },
 
-    // --- EXPORT CHAT TO TXT ---
+    submitQuiz(questions) {
+        UI.showQuizResults(questions);
+    },
+
     exportChat() {
         const history = document.getElementById('chat-history');
         const messages = history.querySelectorAll('.message-group');
         
-        // Check if there's actual conversation (ignoring the initial AI greeting)
-        if (messages.length <= 1) {
-            UI.showError("No conversation to export yet.");
-            return;
-        }
+        if (messages.length <= 1) return UI.showError("No conversation to export yet.");
 
         let textContent = "=========================================\n";
         textContent += "          GDENAI STUDY SESSION           \n";
@@ -168,57 +179,36 @@ const App = {
         messages.forEach(msg => {
             const isUser = msg.classList.contains('user-group');
             const bubble = msg.querySelector('.message-bubble');
-            
-            // Skip typing indicators
-            if (!bubble || bubble.querySelector('.typing-indicator')) return; 
+            if (!bubble) return;
 
             if (isUser) {
                 textContent += `[STUDENT]:\n${bubble.innerText.trim()}\n\n`;
             } else {
-                // Clone the bubble so we can safely manipulate the text without affecting the UI
                 const clone = bubble.cloneNode(true);
                 const sourcesContainer = clone.querySelector('.sources-container');
-                
                 let answerText = clone.innerText.trim();
                 
-                // If there are sources, format them cleanly at the bottom
                 if (sourcesContainer) {
                     const sourceTexts = Array.from(sourcesContainer.querySelectorAll('.source-item')).map(s => s.innerText.trim());
-                    
-                    // Remove the raw HTML sources block from the main answer text
                     answerText = answerText.replace(sourcesContainer.innerText, '').trim();
-                    
-                    textContent += `[GDENAI]:\n${answerText}\n\n`;
-                    textContent += `Sources Cited:\n- ${sourceTexts.join('\n- ')}\n\n`;
+                    textContent += `[GDENAI]:\n${answerText}\n\nSources:\n- ${sourceTexts.join('\n- ')}\n\n`;
                 } else {
                     textContent += `[GDENAI]:\n${answerText}\n\n`;
                 }
             }
         });
 
-        textContent += "=========================================\n";
-        textContent += "Exported from GDenAI - Open Source Study Context Engine\n";
-
-        // Create a Blob and trigger download
         const blob = new Blob([textContent], { type: 'text/plain' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
-        
-        // Format date for filename (YYYY-MM-DD)
-        const dateString = new Date().toISOString().split('T')[0];
         a.href = url;
-        a.download = `GDenAI_Notes_${dateString}.txt`;
-        
+        a.download = `GDenAI_Notes_${new Date().toISOString().split('T')[0]}.txt`;
         document.body.appendChild(a);
         a.click();
-        
-        // Cleanup
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
-        
-        UI.showError("Chat exported successfully!"); // Reusing toast for success message
+        UI.showError("Chat exported successfully!"); 
     }
 };
 
-// Start App when DOM is ready
 document.addEventListener('DOMContentLoaded', () => App.init());
