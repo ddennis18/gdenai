@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
 
-import httpx
+from fastembed import TextEmbedding
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -41,41 +41,21 @@ class ChatClient(Protocol):
     def chat(self) -> Any: ...
 
 
-class HFInferenceEmbedder:
-    def __init__(self, api_token: str, model_name: str):
-        # Updated to the correct Hugging Face router URL for feature-extraction
-        self.api_url = f"https://router.huggingface.co/hf-inference/models/{model_name}/pipeline/feature-extraction"
-        self.headers = {"Authorization": f"Bearer {api_token}"}
+class FastEmbedEmbedder:
+    def __init__(self, model_name: str):
+        # FastEmbed automatically downloads and uses the ONNX model
+        self.model = TextEmbedding(model_name=model_name)
 
     def encode(self, text: str, normalize_embeddings: bool = True) -> list[float]:
-        with httpx.Client(timeout=30.0) as client:
-            for attempt in range(3):
-                try:
-                    response = client.post(
-                        self.api_url,
-                        headers=self.headers,
-                        json={"inputs": text}
-                    )
-                    response.raise_for_status()
-                    data = response.json()
-                    
-                    # Handle the API response shape
-                    embedding = data[0] if isinstance(data[0], list) else data
-                    
-                    if normalize_embeddings:
-                        norm = math.sqrt(sum(x*x for x in embedding))
-                        if norm > 0:
-                            embedding = [x / norm for x in embedding]
-                    return embedding
-                    
-                except httpx.HTTPStatusError as exc:
-                    if exc.response.status_code in (429, 503):
-                        continue  # Retry on rate limit or cold start
-                    raise RuntimeError(f"HF API Error: {exc.response.text}")
-                except Exception as exc:
-                    if attempt == 2:
-                        raise RuntimeError(f"Failed to generate embeddings: {str(exc)}")
-        raise RuntimeError("Failed to generate embeddings after retries.")
+        # FastEmbed returns a generator, we need the first element
+        embeddings = list(self.model.embed([text]))
+        vector = embeddings[0].tolist()
+
+        if normalize_embeddings:
+            norm = math.sqrt(sum(x * x for x in vector))
+            if norm > 0:
+                vector = [x / norm for x in vector]
+        return vector
 
 
 @dataclass
@@ -101,8 +81,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        loaded_embedder = embedder or HFInferenceEmbedder(
-            api_token=loaded_settings.hf_token,
+        loaded_embedder = embedder or FastEmbedEmbedder(
             model_name=loaded_settings.embedding_model
         )
         loaded_llm = llm or _create_llm_client(loaded_settings)
@@ -133,7 +112,7 @@ def create_app(
         allow_headers=["*"],
     )
 
-    # --- CRITICAL FIX: Manually inject CORS headers on 500 errors ---
+    # Manually inject CORS headers on 500 errors so the frontend can read them
     @app.exception_handler(Exception)
     async def unexpected_error_handler(request: Request, exc: Exception):
         response = JSONResponse(
@@ -145,7 +124,6 @@ def create_app(
             response.headers["Access-Control-Allow-Origin"] = origin
             response.headers["Access-Control-Allow-Credentials"] = "true"
         return response
-    # ----------------------------------------------------------------
 
     @app.exception_handler(HTTPException)
     async def http_error_handler(_, exc: HTTPException) -> JSONResponse:
@@ -220,10 +198,7 @@ def create_app(
                 emb = await asyncio.to_thread(_vector(app).encode, chunk.text, normalize_embeddings=True)
                 embeddings.append(emb)
         except Exception as e:
-            raise HTTPException(
-                502,
-                {"error": "embedding_failed", "message": f"Failed to generate embeddings from Hugging Face: {str(e)}"},
-            )
+            raise HTTPException(500, {"error": "embedding_failed", "message": str(e)})
 
         documents = [
             StoredDocument(document_id, filename, chunk.text, chunk.page, embedding)
@@ -277,7 +252,7 @@ def create_app(
         try:
             query_emb = await asyncio.to_thread(runtime.embedder.encode, request.question, normalize_embeddings=True)
         except Exception as e:
-            raise HTTPException(502, {"error": "embedding_failed", "message": str(e)})
+            raise HTTPException(500, {"error": "embedding_failed", "message": str(e)})
             
         matches = session.search(list(query_emb), request.top_k)
         if not matches:
@@ -318,7 +293,7 @@ def create_app(
         try:
             query_emb = await asyncio.to_thread(runtime.embedder.encode, request.question, normalize_embeddings=True)
         except Exception as e:
-            return JSONResponse(status_code=502, content={"error": "embedding_failed", "message": str(e)})
+            return JSONResponse(status_code=500, content={"error": "embedding_failed", "message": str(e)})
 
         matches = session.search(
             list(query_emb),

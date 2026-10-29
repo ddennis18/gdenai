@@ -8,9 +8,8 @@ class Settings(BaseSettings):
     llm_api_key: str
     llm_model: str
     
-    # ADDED: Hugging Face Token and updated model path
-    hf_token: str
-    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    # Changed to a fastembed compatible model
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
     
     session_ttl_minutes: int = 45
     top_k: int = 5
