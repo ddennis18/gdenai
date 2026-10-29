@@ -21,10 +21,10 @@
         <!-- Sidebar (Quick view of documents) -->
         <aside class="sidebar">
             <h2 class="sidebar-header">Active Context</h2>
-            <div class="quick-upload" id="quick-upload-btn">
-                <span style="font-size: var(--text-small); color: var(--text-muted);">+ Add Document</span>
-                <input type="file" id="quick-file-input" accept=".pdf,.docx,.txt" hidden>
-            </div>
+            <label for="quick-file-input" class="quick-upload" id="quick-upload-btn" style="display: block; cursor: pointer;">
+    <span style="font-size: var(--text-small); color: var(--text-muted);">+ Add Document</span>
+    <input type="file" id="quick-file-input" accept=".pdf,.docx,.txt" hidden>
+</label>
             
             <div class="doc-list" id="sidebar-doc-list">
                 <!-- Rendered by JS -->

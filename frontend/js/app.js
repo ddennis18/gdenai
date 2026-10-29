@@ -29,7 +29,7 @@ const App = {
         const browseBtn = document.getElementById('browse-btn');
         const clearBtn = document.getElementById('clear-btn');
 
-        browseBtn.addEventListener('click', () => fileInput.click());
+        
         fileInput.addEventListener('change', (e) => {
             if (e.target.files.length > 0) this.handleUpload(e.target.files[0]);
         });
@@ -66,7 +66,7 @@ const App = {
         const prompts = document.querySelectorAll('.prompt-chip');
         const exportBtn = document.getElementById('export-chat-btn');
 
-        quickUploadBtn.addEventListener('click', () => quickFileInput.click());
+    
         quickFileInput.addEventListener('change', (e) => {
             if (e.target.files.length > 0) this.handleUpload(e.target.files[0]);
         });
