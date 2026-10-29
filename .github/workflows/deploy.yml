@@ -9,6 +9,11 @@ permissions:
   pages: write
   id-token: write
 
+# Allow only one concurrent deployment
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
 jobs:
   deploy:
     environment:
@@ -18,12 +23,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Setup Pages
         uses: actions/configure-pages@v4
+        with:
+          enablement: true # <--- THIS AUTOMATICALLY TURNS ON PAGES
+
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: './frontend' # This tells it to only deploy the frontend folder
+          path: './frontend' # Tells GitHub to only deploy the frontend folder
+
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
