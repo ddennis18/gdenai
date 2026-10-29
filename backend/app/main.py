@@ -3,13 +3,12 @@ from dataclasses import dataclass
 import asyncio
 import json
 import math
-import time
 from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
 
 import httpx
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -22,7 +21,6 @@ from .documents import SUPPORTED_EXTENSIONS, chunk_pages, extract_pages
 from .prompts import QUIZ_SYSTEM_PROMPT, SYSTEM_PROMPT
 from .schemas import (
     ChatRequest,
-    ChatSource,
     DocumentResponse,
     ErrorResponse,
     QueryRequest,
@@ -43,33 +41,25 @@ class ChatClient(Protocol):
     def chat(self) -> Any: ...
 
 
-# --- REPLACED: Lightweight Hugging Face Inference API Embedder ---
 class HFInferenceEmbedder:
     def __init__(self, api_token: str, model_name: str):
-        self.api_url = f"https://api-inference.huggingface.co/models/{model_name}"
+        # Updated to the correct Hugging Face router URL for feature-extraction
+        self.api_url = f"https://router.huggingface.co/hf-inference/models/{model_name}/pipeline/feature-extraction"
         self.headers = {"Authorization": f"Bearer {api_token}"}
 
     def encode(self, text: str, normalize_embeddings: bool = True) -> list[float]:
-        # We use a retry loop to handle HF free-tier rate limits (429) and model loading (503)
         with httpx.Client(timeout=30.0) as client:
-            for attempt in range(5):
+            for attempt in range(3):
                 try:
                     response = client.post(
                         self.api_url,
                         headers=self.headers,
-                        json={"inputs": text, "options": {"wait_for_model": True}}
+                        json={"inputs": text}
                     )
-                    if response.status_code == 503:
-                        time.sleep(2)
-                        continue
-                    if response.status_code == 429:
-                        time.sleep(2)
-                        continue
-                    
                     response.raise_for_status()
                     data = response.json()
                     
-                    # Handle HF API returning nested lists vs flat lists
+                    # Handle the API response shape
                     embedding = data[0] if isinstance(data[0], list) else data
                     
                     if normalize_embeddings:
@@ -78,11 +68,14 @@ class HFInferenceEmbedder:
                             embedding = [x / norm for x in embedding]
                     return embedding
                     
-                except httpx.HTTPError as exc:
-                    if attempt == 4:
-                        raise RuntimeError(f"Failed to get embeddings from HF: {exc}")
-                    time.sleep(2)
-        return []
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code in (429, 503):
+                        continue  # Retry on rate limit or cold start
+                    raise RuntimeError(f"HF API Error: {exc.response.text}")
+                except Exception as exc:
+                    if attempt == 2:
+                        raise RuntimeError(f"Failed to generate embeddings: {str(exc)}")
+        raise RuntimeError("Failed to generate embeddings after retries.")
 
 
 @dataclass
@@ -108,7 +101,6 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # Use the new lightweight embedder
         loaded_embedder = embedder or HFInferenceEmbedder(
             api_token=loaded_settings.hf_token,
             model_name=loaded_settings.embedding_model
@@ -141,6 +133,20 @@ def create_app(
         allow_headers=["*"],
     )
 
+    # --- CRITICAL FIX: Manually inject CORS headers on 500 errors ---
+    @app.exception_handler(Exception)
+    async def unexpected_error_handler(request: Request, exc: Exception):
+        response = JSONResponse(
+            content=ErrorResponse(error="internal_error", message=str(exc)).model_dump(),
+            status_code=500,
+        )
+        origin = request.headers.get("origin")
+        if origin and origin in allowed_origins:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+        return response
+    # ----------------------------------------------------------------
+
     @app.exception_handler(HTTPException)
     async def http_error_handler(_, exc: HTTPException) -> JSONResponse:
         code = exc.detail.get("error", "http_error") if isinstance(exc.detail, dict) else "http_error"
@@ -157,13 +163,6 @@ def create_app(
                 error="validation_error", message=str(exc.errors())
             ).model_dump(),
             status_code=422,
-        )
-
-    @app.exception_handler(Exception)
-    async def unexpected_error_handler(_, __: Exception) -> JSONResponse:
-        return JSONResponse(
-            content=ErrorResponse(error="internal_error", message="Internal server error").model_dump(),
-            status_code=500,
         )
 
     @app.get("/health")
@@ -215,12 +214,16 @@ def create_app(
 
         document_id = str(uuid4())
         
-        # --- NOTE: We are calling the HF API sequentially here. 
-        # For a demo, this takes ~1-2 seconds per chunk. 
-        embeddings = []
-        for chunk in chunks:
-            emb = await asyncio.to_thread(_vector(app).encode, chunk.text, normalize_embeddings=True)
-            embeddings.append(emb)
+        try:
+            embeddings = []
+            for chunk in chunks:
+                emb = await asyncio.to_thread(_vector(app).encode, chunk.text, normalize_embeddings=True)
+                embeddings.append(emb)
+        except Exception as e:
+            raise HTTPException(
+                502,
+                {"error": "embedding_failed", "message": f"Failed to generate embeddings from Hugging Face: {str(e)}"},
+            )
 
         documents = [
             StoredDocument(document_id, filename, chunk.text, chunk.page, embedding)
@@ -271,11 +274,12 @@ def create_app(
         session: Session = Depends(get_existing_session),
     ) -> QueryResponse:
         runtime = _runtime(app)
-        query_emb = await asyncio.to_thread(runtime.embedder.encode, request.question, normalize_embeddings=True)
-        matches = session.search(
-            list(query_emb),
-            request.top_k,
-        )
+        try:
+            query_emb = await asyncio.to_thread(runtime.embedder.encode, request.question, normalize_embeddings=True)
+        except Exception as e:
+            raise HTTPException(502, {"error": "embedding_failed", "message": str(e)})
+            
+        matches = session.search(list(query_emb), request.top_k)
         if not matches:
             raise HTTPException(404, {"error": "no_documents", "message": "No documents found for this session"})
 
@@ -311,7 +315,11 @@ def create_app(
         session: Session = Depends(get_existing_session),
     ) -> StreamingResponse:
         runtime = _runtime(app)
-        query_emb = await asyncio.to_thread(runtime.embedder.encode, request.question, normalize_embeddings=True)
+        try:
+            query_emb = await asyncio.to_thread(runtime.embedder.encode, request.question, normalize_embeddings=True)
+        except Exception as e:
+            return JSONResponse(status_code=502, content={"error": "embedding_failed", "message": str(e)})
+
         matches = session.search(
             list(query_emb),
             runtime.top_k,
@@ -334,10 +342,7 @@ def create_app(
             for turn in (request.history or [])[-4:]
         )
         messages.append(
-            {
-                "role": "user",
-                "content": f"Context:\n{context}\n\nQuestion: {request.question}",
-            }
+            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {request.question}"}
         )
         stream = await _start_chat_stream(runtime, messages)
         
@@ -354,10 +359,7 @@ def create_app(
     ) -> list[QuizQuestion]:
         chunks = session.sample_document_chunks(request.document_id, request.num_questions)
         if not chunks:
-            raise HTTPException(
-                404,
-                {"error": "document_not_found", "message": "Document not found"},
-            )
+            raise HTTPException(404, {"error": "document_not_found", "message": "Document not found"})
 
         context = "\n\n".join(
             f"[{document.filename}, page {document.page}]\n{document.text}"
@@ -365,13 +367,7 @@ def create_app(
         )
         messages = [
             {"role": "system", "content": QUIZ_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"Create {request.num_questions} multiple-choice questions from these excerpts. "
-                    f"Return a JSON array only.\n\n{context}"
-                ),
-            },
+            {"role": "user", "content": f"Create {request.num_questions} multiple-choice questions from these excerpts. Return a JSON array only.\n\n{context}"},
         ]
         for attempt in range(2):
             try:
@@ -379,29 +375,16 @@ def create_app(
             except HTTPException:
                 raise
             except Exception as exc:
-                raise HTTPException(
-                    502,
-                    {"error": "provider_error", "message": "The LLM provider request failed"},
-                ) from exc
+                raise HTTPException(502, {"error": "provider_error", "message": "The LLM provider request failed"}) from exc
             try:
                 payload = json.loads(completion.choices[0].message.content or "")
                 questions = TypeAdapter(list[QuizQuestion]).validate_python(payload)
                 if len(questions) != request.num_questions:
                     raise ValueError("The LLM returned the wrong number of questions")
                 return questions
-            except (
-                json.JSONDecodeError,
-                ValidationError,
-                TypeError,
-                ValueError,
-                IndexError,
-                AttributeError,
-            ) as exc:
+            except (json.JSONDecodeError, ValidationError, TypeError, ValueError, IndexError, AttributeError) as exc:
                 if attempt == 1:
-                    raise HTTPException(
-                        502,
-                        {"error": "invalid_quiz_response", "message": "The LLM returned invalid quiz JSON"},
-                    ) from exc
+                    raise HTTPException(502, {"error": "invalid_quiz_response", "message": "The LLM returned invalid quiz JSON"}) from exc
         raise RuntimeError("unreachable")
 
     return app
@@ -432,16 +415,10 @@ async def _start_chat_stream(runtime: Runtime, messages: list[dict[str, str]]) -
             )
         except RateLimitError as exc:
             if attempt == 2:
-                raise HTTPException(
-                    429,
-                    {"error": "rate_limited", "message": "The LLM provider rate limit was exceeded"},
-                ) from exc
+                raise HTTPException(429, {"error": "rate_limited", "message": "The LLM provider rate limit was exceeded"}) from exc
             await asyncio.sleep(0.25 * (2**attempt))
         except Exception as exc:
-            raise HTTPException(
-                502,
-                {"error": "provider_error", "message": "The LLM provider request failed"},
-            ) from exc
+            raise HTTPException(502, {"error": "provider_error", "message": "The LLM provider request failed"}) from exc
     raise RuntimeError("unreachable")
 
 
@@ -466,12 +443,7 @@ async def _chat_events(stream: Any, matches: list[tuple[StoredDocument, float]])
         {
             "type": "sources",
             "sources": [
-                {
-                    "doc_id": document.document_id,
-                    "filename": document.filename,
-                    "page": document.page,
-                    "snippet": document.text[:240],
-                }
+                {"doc_id": document.document_id, "filename": document.filename, "page": document.page, "snippet": document.text[:240]}
                 for document, _ in matches
             ],
         }
