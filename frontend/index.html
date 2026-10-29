@@ -2,9 +2,12 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#601178">
     <title>GDenAI | Study Context Engine</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Lora:wght@500;600&display=swap" rel="stylesheet">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Lora:wght@500;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
@@ -18,27 +21,73 @@
     </nav>
 
     <main class="hero-section">
-        <h1 class="hero-title">Master your syllabus. Not the search bar.</h1>
-        <p class="hero-subtitle">GDenAI uses open-weight AI to extract exact answers from your lecture materials, PDFs, and notes, complete with page-level citations. No hallucinations. Just your materials.</p>
-        <a href="chat.html" class="btn btn-primary">Start Querying</a>
+        <div class="hero-copy">
+            <h1 class="hero-title">Master your syllabus. Not the search bar.</h1>
+            <p class="hero-subtitle">GDenAI uses open-weight AI to extract exact answers from your lecture materials, PDFs, and notes, complete with page-level citations. No hallucinations. Just your materials.</p>
+            <div class="hero-actions">
+                <a href="chat.html" class="btn btn-primary btn-lg">Start querying</a>
+                <a href="documents.html" class="btn btn-outline btn-lg">Add study materials</a>
+            </div>
+            <p class="hero-note">Works with PDF, DOCX and TXT files.</p>
+        </div>
+
+        <!-- Example conversation: shows the citation behaviour instead of describing it -->
+        <div class="demo-window" role="img" aria-label="Example: a question answered from a lecture PDF with a page citation">
+            <div class="demo-bar">
+                <span>Query AI</span>
+                <span class="demo-doc">EEE201_Circuit_Analysis.pdf</span>
+            </div>
+            <div class="demo-body">
+                <div class="demo-q demo-step s1">What does Kirchhoff's current law say?</div>
+                <div class="demo-a demo-step s2">
+                    <p>The total current entering a node equals the total current leaving it.</p>
+                    <p>Write one equation per node to solve for unknown branch currents.</p>
+                    <div class="sources-container demo-step s3" style="margin-top: var(--space-3);">
+                        <strong>Sources</strong>
+                        <span class="source-item"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>EEE201_Circuit_Analysis.pdf &mdash; Page 14</span>
+                    </div>
+                </div>
+            </div>
+        </div>
     </main>
+
+    <section class="section-inner">
+        <h2 class="section-title">From lecture notes to a cited answer in three steps</h2>
+        <ol class="steps">
+            <li>
+                <h3>Upload</h3>
+                <p>Add your PDFs, slides and notes in My Materials.</p>
+            </li>
+            <li>
+                <h3>Ask</h3>
+                <p>Type a question, or pick a suggested prompt in Query AI.</p>
+            </li>
+            <li>
+                <h3>Verify</h3>
+                <p>Check the filename and page number under every answer.</p>
+            </li>
+        </ol>
+    </section>
 
     <section class="features-grid">
         <div class="feature-card">
+            <div class="feature-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg></div>
             <h3>Source-Grounded</h3>
             <p>Every answer includes the exact filename and page number. Verify the context instantly.</p>
         </div>
         <div class="feature-card">
+            <div class="feature-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="11" width="18" height="11" rx="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg></div>
             <h3>Open Architecture</h3>
             <p>Built with open-weight embedding models and fast inference. Secure, private, and reproducible.</p>
         </div>
         <div class="feature-card">
+            <div class="feature-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg></div>
             <h3>Context Management</h3>
             <p>Upload, review, and delete study materials in a dedicated workspace before you query the AI.</p>
         </div>
     </section>
-    
-    <footer style="text-align: center; padding: var(--space-4); font-size: var(--text-micro); color: var(--text-muted);">
+
+    <footer class="site-footer">
         Created by GDenAI team.
     </footer>
 

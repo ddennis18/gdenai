@@ -2,182 +2,338 @@
 // DOM MANIPULATION & XSS PROTECTION
 // =========================================
 const UI = {
-    formatAIResponse(text) {
-        // Escape HTML
-        let safeText = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-        // Basic Markdown
-        safeText = safeText.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
-        safeText = safeText.replace(/\*(.*?)\*/g, '<em>$1</em>');
-        safeText = safeText.replace(/\n/g, '<br>');
-        safeText = safeText.replace(/- (.*?)(?:\n|$)/g, '<li>$1</li>');
-        if (safeText.includes('<li>')) {
-            safeText = safeText.replace(/(<li>.*?<\/li>)/g, '<ul>$1</ul>');
-        }
-        return safeText;
+    _quiz: null,
+    _escBound: false,
+
+    // ---------- helpers ----------
+    escapeHtml(str) {
+        return String(str ?? '')
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     },
 
+    _scrollChat() {
+        const history = document.getElementById('chat-history');
+        if (history) history.scrollTop = history.scrollHeight;
+    },
+
+    // Inline markdown: `code`, **bold**, *italic* (input is escaped first)
+    _inline(text) {
+        return text.split(/(`[^`]+`)/).map(part => {
+            if (part.length > 2 && part.startsWith('`') && part.endsWith('`')) {
+                return `<code>${this.escapeHtml(part.slice(1, -1))}</code>`;
+            }
+            return this.escapeHtml(part)
+                .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+                .replace(/(^|[^*])\*(?!\s)(.+?)\*(?!\*)/g, '$1<em>$2</em>');
+        }).join('');
+    },
+
+    // Block markdown: headings, bullet + numbered lists, code fences, paragraphs.
+    // Safe to call on partial text while streaming.
+    formatAIResponse(text) {
+        const lines = String(text ?? '').replace(/\r\n/g, '\n').split('\n');
+        const out = [];
+        let list = null, para = [], code = null;
+
+        const flushPara = () => {
+            if (para.length) { out.push(`<p>${para.map(l => this._inline(l)).join('<br>')}</p>`); para = []; }
+        };
+        const flushList = () => { if (list) { out.push(`</${list}>`); list = null; } };
+        const openList = (tag) => { if (list !== tag) { flushList(); out.push(`<${tag}>`); list = tag; } };
+
+        for (const line of lines) {
+            if (/^\s*```/.test(line)) {
+                if (code === null) { flushPara(); flushList(); code = []; }
+                else { out.push(`<pre><code>${this.escapeHtml(code.join('\n'))}</code></pre>`); code = null; }
+                continue;
+            }
+            if (code !== null) { code.push(line); continue; }
+
+            let m;
+            if ((m = line.match(/^(#{1,3})\s+(.*)$/))) {
+                flushPara(); flushList();
+                const level = m[1].length + 2; // # -> h3
+                out.push(`<h${level}>${this._inline(m[2])}</h${level}>`);
+            } else if ((m = line.match(/^\s*[-*\u2022]\s+(.*)$/))) {
+                flushPara(); openList('ul');
+                out.push(`<li>${this._inline(m[1])}</li>`);
+            } else if ((m = line.match(/^\s*\d+[.)]\s+(.*)$/))) {
+                flushPara(); openList('ol');
+                out.push(`<li>${this._inline(m[1])}</li>`);
+            } else if (!line.trim()) {
+                flushPara(); flushList();
+            } else {
+                flushList(); para.push(line);
+            }
+        }
+        if (code !== null) out.push(`<pre><code>${this.escapeHtml(code.join('\n'))}</code></pre>`);
+        flushPara(); flushList();
+        return out.join('');
+    },
+
+    _fileExt(name) {
+        const ext = String(name || '').split('.').pop().toLowerCase();
+        return ['pdf', 'docx', 'txt'].includes(ext) ? ext : 'file';
+    },
+
+    // ---------- documents ----------
     renderDocuments() {
         const docs = State.documents;
-        
-        // Documents Page
+
+        // Live counts (sidebar pill, mobile toggle button, etc.)
+        document.querySelectorAll('[data-doc-count]').forEach(el => { el.textContent = docs.length; });
+
+        // Documents page
         const grid = document.getElementById('documents-grid');
         if (grid) {
             if (docs.length === 0) {
-                grid.innerHTML = '<p style="color: var(--text-muted); font-style: italic;">No study materials uploaded yet.</p>';
-                return;
+                grid.innerHTML = `<div class="empty-state"><strong>No study materials yet</strong>Upload a PDF, DOCX or TXT file above and it will show up here, ready to query.</div>`;
+            } else {
+                grid.innerHTML = docs.map(doc => {
+                    const name = this.escapeHtml(doc.filename);
+                    const ext = this._fileExt(doc.filename);
+                    const pages = Number(doc.pages) || 0, chunks = Number(doc.chunks) || 0;
+                    return `
+                    <div class="doc-card">
+                        <div class="doc-badge" data-ext="${ext}" aria-hidden="true">${ext === 'file' ? 'DOC' : ext.toUpperCase()}</div>
+                        <div class="doc-card-info">
+                            <h4 title="${name}">${name}</h4>
+                            <p>${pages} ${pages === 1 ? 'page' : 'pages'} &bull; ${chunks} ${chunks === 1 ? 'chunk' : 'chunks'}</p>
+                        </div>
+                        <div class="doc-card-actions">
+                            <button class="btn btn-outline btn-sm" type="button" data-action="quiz" data-id="${this.escapeHtml(doc.id)}" data-name="${name}">Quiz me</button>
+                            <button class="btn-icon" type="button" data-action="delete" data-id="${this.escapeHtml(doc.id)}" aria-label="Delete ${name}">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+                            </button>
+                        </div>
+                    </div>`;
+                }).join('');
             }
-            grid.innerHTML = docs.map(doc => `
-                <div class="doc-card">
-                    <div class="doc-card-info">
-                        <h4 title="${doc.filename}">${doc.filename}</h4>
-                        <p>${doc.pages} Pages &bull; ${doc.chunks} Chunks</p>
-                    </div>
-                    <div style="display:flex; gap: var(--space-2);">
-                        <button class="btn btn-outline" style="padding: var(--space-1) var(--space-2); font-size: var(--text-small);" onclick="App.handleQuiz('${doc.id}', '${doc.filename}')">Quiz</button>
-                        <button class="btn-icon" onclick="App.handleDelete('${doc.id}')" aria-label="Delete">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
-                        </button>
-                    </div>
-                </div>
-            `).join('');
+            // One delegated handler (assignment is idempotent across re-renders)
+            grid.onclick = (e) => {
+                const btn = e.target.closest('[data-action]');
+                if (!btn) return;
+                const { action, id, name } = btn.dataset;
+                if (action === 'quiz') App.handleQuiz(id, name);
+                if (action === 'delete') App.handleDelete(id);
+            };
         }
 
-        // Chat Sidebar
+        // Chat sidebar
         const sidebar = document.getElementById('sidebar-doc-list');
         if (sidebar) {
             if (docs.length === 0) {
-                sidebar.innerHTML = '<p style="font-size: var(--text-small); color: var(--text-muted);">No context loaded.</p>';
-                return;
+                sidebar.innerHTML = `<div class="empty-state"><strong>No context loaded</strong>Add a document and the AI will answer from it, with page citations.</div>`;
+            } else {
+                sidebar.innerHTML = docs.map(doc => {
+                    const name = this.escapeHtml(doc.filename);
+                    return `
+                    <div class="doc-item">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>
+                        <span class="doc-name" title="${name}">${name}</span>
+                    </div>`;
+                }).join('');
             }
-            sidebar.innerHTML = docs.map(doc => `
-                <div class="doc-item">
-                    <span class="doc-name" title="${doc.filename}">${doc.filename}</span>
-                </div>
-            `).join('');
         }
     },
 
+    // ---------- chat ----------
     addMessage(role, htmlContent, id = null) {
         const history = document.getElementById('chat-history');
+        if (!history) return;
         const group = document.createElement('div');
         group.className = `message-group ${role}-group`;
         if (id) group.id = id;
-        
         group.innerHTML = `<div class="message-bubble ${role}-bubble">${htmlContent}</div>`;
         history.appendChild(group);
         history.scrollTop = history.scrollHeight;
     },
 
-    // Used during streaming to append text to the current bubble
+    // Streaming: store raw text, re-render formatted on each chunk
     appendToStream(id, text) {
         const group = document.getElementById(id);
         if (!group) return;
         const bubble = group.querySelector('.message-bubble');
-        
-        // We store raw text in a data attribute to format it properly on each append
-        let rawText = bubble.getAttribute('data-raw') || '';
-        rawText += text;
+
+        const rawText = (bubble.getAttribute('data-raw') || '') + text;
         bubble.setAttribute('data-raw', rawText);
         bubble.innerHTML = this.formatAIResponse(rawText);
-        
-        const history = document.getElementById('chat-history');
-        history.scrollTop = history.scrollHeight;
+
+        // Copy button, added once per answer (lives outside the bubble so re-renders don't wipe it)
+        if (!group.querySelector('.msg-actions')) {
+            const actions = document.createElement('div');
+            actions.className = 'msg-actions';
+            actions.innerHTML = `<button class="copy-btn" type="button" aria-label="Copy answer" title="Copy answer">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg></button>`;
+            actions.querySelector('button').addEventListener('click', () => {
+                this.copyText(bubble.getAttribute('data-raw') || bubble.innerText);
+            });
+            group.appendChild(actions);
+        }
+        this._scrollChat();
     },
 
     addSourcesToStream(id, sources) {
         const group = document.getElementById(id);
         if (!group || !sources || sources.length === 0) return;
         const bubble = group.querySelector('.message-bubble');
-        
-        let html = bubble.innerHTML;
-        html += `<div class="sources-container"><strong>Sources:</strong>`;
+
         const unique = new Set();
+        let chips = '';
         sources.forEach(s => {
-            const label = `${s.filename} — Page ${s.page}`;
-            if (!unique.has(label)) {
-                unique.add(label);
-                html += `<div class="source-item"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg> ${label}</div>`;
-            }
+            const label = `${s.filename} \u2014 Page ${s.page}`;
+            if (unique.has(label)) return;
+            unique.add(label);
+            chips += `<span class="source-item"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>${this.escapeHtml(label)}</span>`;
         });
-        html += `</div>`;
-        bubble.innerHTML = html;
-        document.getElementById('chat-history').scrollTop = document.getElementById('chat-history').scrollHeight;
+        bubble.insertAdjacentHTML('beforeend', `<div class="sources-container"><strong>Sources</strong>${chips}</div>`);
+        this._scrollChat();
     },
 
-    showError(message) {
+    async copyText(text) {
+        try {
+            await navigator.clipboard.writeText(text);
+            this.showToast('Answer copied', 'success');
+        } catch (e) {
+            this.showError('Could not copy. Select the text and copy it manually.');
+        }
+    },
+
+    // ---------- toast ----------
+    showToast(message, type = 'error') {
         let toast = document.getElementById('toast');
         if (!toast) {
             toast = document.createElement('div');
             toast.id = 'toast';
-            toast.className = 'toast';
+            toast.setAttribute('role', 'status');
+            toast.setAttribute('aria-live', 'polite');
             document.body.appendChild(toast);
         }
+        toast.className = `toast ${type === 'success' ? 'success' : ''}`;
         toast.textContent = message;
+        // force reflow so the transition replays on rapid calls
+        void toast.offsetWidth;
         toast.classList.add('show');
-        setTimeout(() => toast.classList.remove('show'), 3500);
+        clearTimeout(this._toastTimer);
+        this._toastTimer = setTimeout(() => toast.classList.remove('show'), 3500);
     },
 
-    // Quiz Modal Logic
+    showError(message) { this.showToast(message, 'error'); },
+
+    // ---------- quiz ----------
+    closeQuiz() {
+        const modal = document.getElementById('quiz-modal');
+        if (modal) modal.remove();
+        document.body.classList.remove('modal-open');
+    },
+
     renderQuizModal(questions, filename) {
+        this._quiz = { questions, filename };
+
         let modal = document.getElementById('quiz-modal');
         if (!modal) {
             modal = document.createElement('div');
             modal.id = 'quiz-modal';
-            modal.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);display:flex;justify-content:center;align-items:center;z-index:1000;padding:var(--space-4);';
+            modal.className = 'modal-backdrop';
             document.body.appendChild(modal);
+            modal.addEventListener('click', (e) => { if (e.target === modal) this.closeQuiz(); });
         }
+        if (!this._escBound) {
+            document.addEventListener('keydown', (e) => { if (e.key === 'Escape') this.closeQuiz(); });
+            this._escBound = true;
+        }
+        document.body.classList.add('modal-open');
 
-        let html = `<div style="background:var(--color-bg-surface); padding:var(--space-5); max-width:600px; width:100%; max-height:90vh; overflow-y:auto; border-top: 4px solid var(--color-brand);">
-            <h2 style="font-family:var(--font-heading); color:var(--color-brand); margin-bottom:var(--space-2);">Quiz: ${filename}</h2>
-            <p style="font-size:var(--text-small); color:var(--text-muted); margin-bottom:var(--space-4);">Test your knowledge based on the uploaded document.</p>
-            <form id="quiz-form">`;
+        const total = questions.length;
+        const body = questions.map((q, index) => `
+            <fieldset class="quiz-q">
+                <legend>${index + 1}. ${this.escapeHtml(q.question)}</legend>
+                <div class="quiz-options">
+                    ${q.options.map(opt => `
+                    <label class="quiz-option">
+                        <input type="radio" name="q${index}" value="${this.escapeHtml(opt)}" required>
+                        <span>${this.escapeHtml(opt)}</span>
+                    </label>`).join('')}
+                </div>
+            </fieldset>`).join('');
 
-        questions.forEach((q, index) => {
-            html += `<div style="margin-bottom:var(--space-4);">
-                <p style="font-weight:600; margin-bottom:var(--space-2);">${index + 1}. ${q.question}</p>
-                <div style="display:flex; flex-direction:column; gap:var(--space-2);">`;
-            q.options.forEach(opt => {
-                html += `<label style="display:flex; align-items:center; gap:var(--space-2); font-size:var(--text-small); cursor:pointer;">
-                    <input type="radio" name="q${index}" value="${opt}" required> ${opt}
-                </label>`;
-            });
-            html += `</div></div>`;
-        });
-
-        html += `</form>
-            <div style="display:flex; justify-content:flex-end; gap:var(--space-3); margin-top:var(--space-4);">
-                <button class="btn btn-outline" onclick="document.getElementById('quiz-modal').remove()">Close</button>
-                <button class="btn btn-primary" onclick="App.submitQuiz(${JSON.stringify(questions).replace(/"/g, '&quot;')})">Submit Answers</button>
+        modal.innerHTML = `
+        <div class="quiz-dialog" role="dialog" aria-modal="true" aria-labelledby="quiz-title">
+            <div class="quiz-head">
+                <h2 id="quiz-title">Quiz: ${this.escapeHtml(filename)}</h2>
+                <p>Questions are generated from this document.</p>
+                <div class="quiz-progress"><div class="quiz-progress-bar" id="quiz-progress-bar"></div></div>
+                <span class="quiz-progress-text" id="quiz-progress-text">0 of ${total} answered</span>
+            </div>
+            <form id="quiz-form" class="quiz-body">${body}</form>
+            <div class="quiz-actions">
+                <button class="btn btn-outline" type="button" id="quiz-close">Close</button>
+                <button class="btn btn-primary" type="button" id="quiz-submit">Submit answers</button>
             </div>
         </div>`;
 
-        modal.innerHTML = html;
+        const form = modal.querySelector('#quiz-form');
+        form.addEventListener('change', () => {
+            const answered = new Set([...new FormData(form).keys()]).size;
+            modal.querySelector('#quiz-progress-bar').style.width = `${(answered / total) * 100}%`;
+            modal.querySelector('#quiz-progress-text').textContent = `${answered} of ${total} answered`;
+        });
+        modal.querySelector('#quiz-close').addEventListener('click', () => this.closeQuiz());
+        modal.querySelector('#quiz-submit').addEventListener('click', () => {
+            if (!form.checkValidity()) { form.reportValidity(); return; }
+            App.submitQuiz(questions);
+        });
+        modal.querySelector('input')?.focus();
     },
 
     showQuizResults(questions) {
         const form = document.getElementById('quiz-form');
+        const dialog = document.querySelector('#quiz-modal .quiz-dialog');
+        if (!form || !dialog) return;
+
         const formData = new FormData(form);
         let score = 0;
 
-        let resultsHtml = `<h3 style="color:var(--color-brand); margin-bottom:var(--space-3);">Results</h3>`;
-
-        questions.forEach((q, index) => {
+        const items = questions.map((q, index) => {
             const selected = formData.get(`q${index}`);
             const isCorrect = selected === q.answer;
             if (isCorrect) score++;
-
-            resultsHtml += `<div style="margin-bottom:var(--space-3); padding:var(--space-2); border-left: 3px solid ${isCorrect ? 'var(--color-ai)' : 'var(--color-error)'}; background: rgba(0,0,0,0.02);">
-                <p style="font-weight:600;">${index + 1}. ${q.question}</p>
-                <p style="font-size:var(--text-small); color: ${isCorrect ? 'var(--color-ai)' : 'var(--color-error)'};">
-                    Your answer: ${selected || 'None'} ${isCorrect ? '(Correct)' : `(Incorrect - Answer: ${q.answer})`}
-                </p>
-                <p style="font-size:var(--text-small); color:var(--text-muted); margin-top:var(--space-1); font-style:italic;">${q.explanation}</p>
+            return `
+            <div class="result-item ${isCorrect ? 'correct' : 'incorrect'}">
+                <p class="q">${index + 1}. ${this.escapeHtml(q.question)}</p>
+                <p class="a">${isCorrect
+                    ? `Correct: ${this.escapeHtml(selected)}`
+                    : `You answered: ${this.escapeHtml(selected || 'No answer')}. Correct answer: ${this.escapeHtml(q.answer)}`}</p>
+                ${q.explanation ? `<p class="why">${this.escapeHtml(q.explanation)}</p>` : ''}
             </div>`;
+        }).join('');
+
+        const pct = Math.round((score / questions.length) * 100);
+        const msg = pct >= 80 ? 'Strong grasp of this material.'
+            : pct >= 50 ? 'Getting there. Review the ones you missed.'
+            : 'Worth another pass through the document.';
+
+        dialog.innerHTML = `
+            <div class="quiz-head">
+                <h2>Results</h2>
+                <p>${this.escapeHtml(this._quiz?.filename || '')}</p>
+            </div>
+            <div class="quiz-body">
+                <div class="score-wrap">
+                    <div class="score-ring" style="--pct:${pct}"><span>${score}/${questions.length}</span></div>
+                    <p class="score-msg">${msg}</p>
+                </div>
+                ${items}
+            </div>
+            <div class="quiz-actions">
+                <button class="btn btn-outline" type="button" id="quiz-retake">Retake quiz</button>
+                <button class="btn btn-primary" type="button" id="quiz-done">Done</button>
+            </div>`;
+
+        dialog.querySelector('#quiz-done').addEventListener('click', () => this.closeQuiz());
+        dialog.querySelector('#quiz-retake').addEventListener('click', () => {
+            if (this._quiz) this.renderQuizModal(this._quiz.questions, this._quiz.filename);
         });
-
-        resultsHtml += `<p style="font-weight:600; font-size:var(--text-h3); text-align:center; margin-top:var(--space-4);">Score: ${score} / ${questions.length}</p>`;
-        resultsHtml += `<div style="display:flex; justify-content:center; margin-top:var(--space-4);"><button class="btn btn-primary" onclick="document.getElementById('quiz-modal').remove()">Done</button></div>`;
-
-        document.querySelector('#quiz-modal > div').innerHTML = resultsHtml;
     }
 };
