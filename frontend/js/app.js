@@ -2,20 +2,26 @@
 // MAIN APPLICATION LOGIC
 // =========================================
 const App = {
-    async init() {
+    init() {
         const path = window.location.pathname;
         
-        // Fetch real documents from backend on page load
-        await State.syncWithBackend();
-
-        if (path.includes('documents.html')) {
+        // 1. Attach event listeners IMMEDIATELY so the page is interactive
+        if (path.includes('documents')) {
             this.initDocumentsPage();
-        } else if (path.includes('chat.html')) {
+        } else if (path.includes('chat')) {
             this.initChatPage();
         }
 
+        // 2. Render documents from local storage instantly
         UI.renderDocuments();
+
+        // 3. Sync with backend in the background (do not block the UI)
+        State.syncWithBackend().then(() => {
+            UI.renderDocuments(); // Re-render if new docs were found on the server
+        }).catch(err => console.warn("Backend sync failed", err));
     },
+
+    
 
     initDocumentsPage() {
         const dropZone = document.getElementById('drop-zone');
